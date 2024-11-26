@@ -453,13 +453,20 @@ else:
       transp.state.incl({ReadPaused})
     else:
       while true:
-        transp.ralen = SockLen(sizeof(Sockaddr_storage))
-        var res = osdefs.recvfrom(fd, baseAddr transp.buffer,
-                                  cint(len(transp.buffer)), cint(0),
-                                  cast[ptr SockAddr](addr transp.raddr),
-                                  addr transp.ralen)
+        var
+          rmsg: Tmsghdr
+          iov: IOVec
+        iov.iov_base = baseAddr transp.buffer
+        iov.iov_len = csize_t(len(transp.buffer))
+        rmsg.msg_iov = addr iov
+        rmsg.msg_iovlen = 1
+        rmsg.msg_name = cast[ptr SockAddr](addr transp.raddr)
+        rmsg.msg_namelen = SockLen(sizeof(Sockaddr_storage))
+
+        var res = osdefs.recvmsg(fd, addr rmsg, 0)
         if res >= 0:
           transp.buflen = res
+          transp.ralen = rmsg.msg_namelen
           asyncSpawn transp.function(transp, transp.getRemoteAddress())
         else:
           let err = osLastError()
