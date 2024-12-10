@@ -16,6 +16,11 @@ import ".."/[asyncloop, osdefs, oserrno, osutils, handles]
 import "."/[common, ipnet]
 import stew/ptrops
 
+# import POSIX and extend for timestamping
+import posix
+const SO_TIMESTAMP = 29 # returns Timeval
+const SO_TIMESTAMPNS = 35 # returns Timespec
+
 export results
 
 type
@@ -53,6 +58,7 @@ type
     ralen: SockLen                  # Reader address length
     waddr: Sockaddr_storage         # Writer address storage
     walen: SockLen                  # Writer address length
+    rxts*: Moment                   # Receive timestamp
     when defined(windows):
       rovl: CustomOverlapped          # Reader OVERLAPPED structure
       wovl: CustomOverlapped          # Writer OVERLAPPED structure
@@ -456,17 +462,34 @@ else:
         var
           rmsg: Tmsghdr
           iov: IOVec
+          cmsgspace = newSeq[byte](CMSG_SPACE(sizeof(Timespec).uint))
         iov.iov_base = baseAddr transp.buffer
         iov.iov_len = csize_t(len(transp.buffer))
         rmsg.msg_iov = addr iov
         rmsg.msg_iovlen = 1
         rmsg.msg_name = cast[ptr SockAddr](addr transp.raddr)
         rmsg.msg_namelen = SockLen(sizeof(Sockaddr_storage))
+        rmsg.msg_control = baseAddr cmsgspace
+        rmsg.msg_controllen = len(cmsgspace).uint
 
         var res = osdefs.recvmsg(fd, addr rmsg, 0)
         if res >= 0:
           transp.buflen = res
           transp.ralen = rmsg.msg_namelen
+
+          ## get reception timestamp from kernel
+          ## TODO: might need to cycle through CMSG in more complex cases, e.g. with IPv6
+          let cmsg: ptr Tcmsghdr = CMSG_FIRSTHDR(addr rmsg)
+          #echo "cmsg: level:", cmsg.cmsg_level, " type:", cmsg.cmsg_type
+          transp.rxts =
+            if cmsg.cmsg_level == SOL_SOCKET and cmsg.cmsg_type == SO_TIMESTAMPNS:
+              let ts = cast[ptr Timespec](CMSG_DATA(cmsg))
+              #echo "sec:", ts.tv_sec.int64, " nsec:", $ts.tv_nsec
+              Moment.init(int64(ts.tv_sec) * 1_000_000_000'i64 + int64(ts.tv_nsec),
+                                     Nanosecond)
+            else:
+              Moment.now()
+
           asyncSpawn transp.function(transp, transp.getRemoteAddress())
         else:
           let err = osLastError()
@@ -580,6 +603,12 @@ else:
 
     if ServerFlags.Broadcast in flags:
       setSockOpt2(localSock, SOL_SOCKET, SO_BROADCAST, 1).isOkOr:
+        if sock == asyncInvalidSocket:
+          closeSocket(localSock)
+        raiseTransportOsError(error)
+
+    if true: # TODO: add ServerFlags
+      setSockOpt2(localSock, SOL_SOCKET, SO_TIMESTAMPNS, 1).isOkOr:
         if sock == asyncInvalidSocket:
           closeSocket(localSock)
         raiseTransportOsError(error)
